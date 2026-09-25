@@ -387,7 +387,10 @@ model VerificationDocument {
   type      String
   mimeType  String
   fileName  String
-  data      Bytes
+  data      Bytes?
+  publicId  String?
+  resourceType String?
+  format    String?
   createdAt DateTime @default(now())
 
   @@unique([userId, type])

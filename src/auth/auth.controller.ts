@@ -5,6 +5,7 @@ import bcrypt from "bcryptjs";
 import { randomUUID } from "node:crypto";
 import type { Request, Response } from "express";
 import { readActor } from "./read-actor";
+import { deleteVerificationDocument, uploadVerificationDocument, verificationDocumentDownloadUrl, type StoredDocument } from "../lib/cloudinary";
 
 const roles = ["SHOP_OWNER", "DELIVERY_BOY"] as const;
 const statuses = ["PENDING", "APPROVED", "REJECTED", "SUSPENDED"] as const;
@@ -29,7 +30,8 @@ function validDocument(file: RegistrationFile) {
 @Controller()
 export class AuthController {
   @Post("auth/signup")
-  async signup(@Body() body: Record<string, unknown>, files?: RegistrationFile[]) {
+  @UseInterceptors(AnyFilesInterceptor({ limits: { files: 6, fileSize: 5 * 1024 * 1024 } }))
+  async signup(@Body() body: Record<string, unknown>, @UploadedFiles() files: RegistrationFile[] = []) {
     const role = String(body.role || "SHOP_OWNER");
     const phone = String(body.phone || "").trim();
     const name = String(body.name || "").trim();
@@ -42,12 +44,16 @@ export class AuthController {
     if (role === "SHOP_OWNER" && (!body.shopName || !body.address)) {
       throw new BadRequestException("Shop name and address are required");
     }
+    if (role === "SHOP_OWNER" &&
+        (files.length > 1 || files.some(file => file.fieldname !== "shopLicense" || !validDocument(file)))) {
+      throw new BadRequestException("Only one valid shop license document is allowed");
+    }
     if (role === "DELIVERY_BOY") {
       if (body.vehicle !== "BIKE" && body.vehicle !== "CYCLE") {
         throw new BadRequestException("Choose bike or cycle");
       }
       const required = body.vehicle === "BIKE" ? [...requiredDocuments, "vehicleCard"] : requiredDocuments;
-      if (!files || files.length !== required.length ||
+      if (files.length !== required.length ||
           required.some(type => files.filter(file => file.fieldname === type).length !== 1) ||
           files.some(file => !validDocument(file))) {
         throw new BadRequestException("Provide valid deed, photo, NID front/back, CV PDF and bike smart card when applicable");
@@ -57,20 +63,35 @@ export class AuthController {
     if (await prisma.user.findFirst({ where: { OR: [{ phone }, { email }] } })) {
       throw new ConflictException("Phone or email already exists");
     }
-    const user = await prisma.user.create({ data: {
-      name, email, phone, password: await bcrypt.hash(password, 12),
-      role: role as "SHOP_OWNER" | "DELIVERY_BOY", status: "PENDING",
-      address: String(body.address || ""), shopName: body.shopName ? String(body.shopName) : null,
-      vehicle: role === "DELIVERY_BOY" ? String(body.vehicle || "BIKE") : null,
-      ...(body.areaId ? { area: { connect: { id: String(body.areaId) } } } : {}),
-      ...(files?.length ? { verificationDocuments: { create: files.map(file => ({
-        type: file.fieldname,
-        mimeType: file.mimetype,
-        fileName: file.originalname.slice(0, 120),
-        data: Uint8Array.from(file.buffer),
-      })) } } : {}),
-    }});
-    return { message: "Registration pending admin approval", id: user.id, status: user.status };
+    const uploaded: StoredDocument[] = [];
+    try {
+      const documents = [];
+      for (const file of files) {
+        const stored = await uploadVerificationDocument(file);
+        uploaded.push(stored);
+        documents.push({
+          type: file.fieldname,
+          mimeType: file.mimetype,
+          fileName: file.originalname.slice(0, 120),
+          publicId: stored.publicId,
+          resourceType: stored.resourceType,
+          format: stored.format,
+        });
+      }
+
+      const user = await prisma.user.create({ data: {
+        name, email, phone, password: await bcrypt.hash(password, 12),
+        role: role as "SHOP_OWNER" | "DELIVERY_BOY", status: "PENDING",
+        address: String(body.address || ""), shopName: body.shopName ? String(body.shopName) : null,
+        vehicle: role === "DELIVERY_BOY" ? String(body.vehicle || "BIKE") : null,
+        ...(body.areaId ? { area: { connect: { id: String(body.areaId) } } } : {}),
+        ...(documents.length ? { verificationDocuments: { create: documents } } : {}),
+      }});
+      return { message: "Registration pending admin approval", id: user.id, status: user.status };
+    } catch (error) {
+      await Promise.allSettled(uploaded.map(deleteVerificationDocument));
+      throw error;
+    }
   }
 
   @Post("auth/login")
@@ -135,8 +156,9 @@ export class AuthController {
   }
 
   @Post("api/register")
-  async registerCustomer(@Body() body: Record<string, unknown>) {
-    return this.signup({ ...body, role: "SHOP_OWNER" });
+  @UseInterceptors(AnyFilesInterceptor({ limits: { files: 1, fileSize: 5 * 1024 * 1024 } }))
+  async registerCustomer(@Body() body: Record<string, unknown>, @UploadedFiles() files: RegistrationFile[] = []) {
+    return this.signup({ ...body, role: "SHOP_OWNER" }, files);
   }
 
   @Post("api/register/delivery-boy")
@@ -154,10 +176,25 @@ export class AuthController {
       where: { userId_type: { userId: id, type } },
     });
     if (!document) throw new NotFoundException();
+    let data: Buffer;
+    if (document.publicId && document.resourceType && document.format) {
+      const url = verificationDocumentDownloadUrl({
+        publicId: document.publicId,
+        resourceType: document.resourceType as StoredDocument["resourceType"],
+        format: document.format,
+      });
+      const cloudinaryResponse = await fetch(url, { cache: "no-store" });
+      if (!cloudinaryResponse.ok) throw new NotFoundException("Document unavailable");
+      data = Buffer.from(await cloudinaryResponse.arrayBuffer());
+    } else if (document.data) {
+      data = Buffer.from(document.data);
+    } else {
+      throw new NotFoundException("Document unavailable");
+    }
     res.setHeader("Content-Type", document.mimeType);
-    res.setHeader("Content-Disposition", "attachment");
+    res.setHeader("Content-Disposition", `attachment; filename="${document.fileName.replace(/[^a-zA-Z0-9._-]/g, "_")}"`);
     res.setHeader("Cache-Control", "private, no-store");
-    res.send(Buffer.from(document.data));
+    res.send(data);
   }
 
   @Post("api/admin/users/update-status")
